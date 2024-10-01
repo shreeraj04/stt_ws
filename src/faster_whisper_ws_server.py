@@ -12,94 +12,52 @@ import time
 import uuid
 import logging
 import wave
-import webrtcvad
-import collections
-
+ 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
+ 
 clients = {}
 audio_model = None  # Global model instance
-vad = webrtcvad.Vad(3)  # Create a VAD instance with aggressiveness level 3 (0-3)
-
-def frame_generator(frame_duration_ms, audio, sample_rate):
-    """Generates audio frames from PCM audio data.
-    Takes the desired frame duration in milliseconds, the PCM data, and
-    the sample rate.
-    Yields Frames of the requested duration.
+ 
+def get_resource_usage():
+    process = psutil.Process(os.getpid())
+    cpu_percent = process.cpu_percent(interval=1)
+    memory_info = process.memory_info()
+    return cpu_percent, memory_info.rss / (1024 * 1024)  # RSS in MB
+ 
+def is_speech(audio_chunk, energy_threshold):
     """
-    n = int(sample_rate * (frame_duration_ms / 1000.0) * 2)
-    offset = 0
-    timestamp = 0.0
-    duration = (float(n) / sample_rate) / 2.0
-    while offset + n < len(audio):
-        yield (audio[offset:offset + n], timestamp, duration)
-        timestamp += duration
-        offset += n
-
-def vad_collector(sample_rate, frame_duration_ms, padding_duration_ms, vad, frames):
-    """Filters out non-voiced audio frames.
-    Given a webrtcvad.Vad and a source of audio frames, yields only
-    the voiced audio.
-    Uses a padded, sliding window algorithm over the audio frames.
-    When more than 90% of the frames in the window are voiced (as
-    reported by the VAD), the collector triggers and begins yielding
-    audio frames. Then the collector waits until 90% of the frames in
-    the window are unvoiced to detrigger.
-    The window is padded at the front and back to provide a small
-    amount of silence or the beginnings/endings of speech around the
-    voiced frames.
-    Arguments:
-    sample_rate - The audio sample rate, in Hz.
-    frame_duration_ms - The frame duration in milliseconds.
-    padding_duration_ms - The amount to pad the window, in milliseconds.
-    vad - An instance of webrtcvad.Vad.
-    frames - a source of audio frames (sequence or generator).
-    Returns: A generator that yields PCM audio data.
+    Check if the audio chunk contains speech based on energy threshold.
     """
-    num_padding_frames = int(padding_duration_ms / frame_duration_ms)
-    # We use a deque for our sliding window/ring buffer.
-    ring_buffer = collections.deque(maxlen=num_padding_frames)
-    # We have two states: TRIGGERED and NOTTRIGGERED. We start in the
-    # NOTTRIGGERED state.
-    triggered = False
-
-    voiced_frames = []
-    for frame, timestamp, duration in frames:
-        is_speech = vad.is_speech(frame, sample_rate)
-
-        if not triggered:
-            ring_buffer.append((frame, is_speech))
-            num_voiced = len([f for f, speech in ring_buffer if speech])
-            # If we're NOTTRIGGERED and more than 90% of the frames in
-            # the ring buffer are voiced frames, then enter the
-            # TRIGGERED state.
-            if num_voiced > 0.9 * ring_buffer.maxlen:
-                triggered = True
-                # We want to yield all the audio we see from now until
-                # we are NOTTRIGGERED, but we have to start with the
-                # audio that's already in the ring buffer.
-                for f, s in ring_buffer:
-                    voiced_frames.append(f)
-                ring_buffer.clear()
-        else:
-            # We're in the TRIGGERED state, so collect the audio data
-            # and add it to the ring buffer.
-            voiced_frames.append(frame)
-            ring_buffer.append((frame, is_speech))
-            num_unvoiced = len([f for f, speech in ring_buffer if not speech])
-            # If more than 90% of the frames in the ring buffer are
-            # unvoiced, then enter NOTTRIGGERED and yield whatever
-            # audio we've collected.
-            if num_unvoiced > 0.9 * ring_buffer.maxlen:
-                triggered = False
-                yield b''.join(voiced_frames)
-                ring_buffer.clear()
-                voiced_frames = []
-    if voiced_frames:
-        yield b''.join(voiced_frames)
-
+    audio_data = np.frombuffer(audio_chunk, dtype=np.int16)
+    energy = np.sum(audio_data.astype(float) ** 2) / len(audio_data)
+    return energy > energy_threshold
+ 
+def save_session_audio(audio_data, client_id, sample_rate=16000):
+    """
+    Save the entire session's audio data as a single .wav file.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"session_audio_{client_id}_{timestamp}.wav"
+    with wave.open(filename, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 2 bytes for int16
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio_data)
+    logger.info(f"Saved session audio: {filename}")
+ 
+def filter_false_positives(text, min_words=3, min_confidence=0.5):
+    """
+    Filter out potential false positives like isolated "thank you" messages.
+    """
+    words = text.split()
+    if len(words) < min_words:
+        common_phrases = ["thank you", "thanks", "okay", "bye"]
+        if any(phrase in text.lower() for phrase in common_phrases):
+            return ""
+    return text
+ 
 async def transcribe_audio(websocket, path, args):
     client_id = str(uuid.uuid4())
     clients[client_id] = {
@@ -111,11 +69,11 @@ async def transcribe_audio(websocket, path, args):
         "session_audio": bytes()
     }
     logger.info(f"New client connected: {client_id}")
-
+ 
     start_time = time.time()
     max_cpu_usage = 0
     max_memory_usage = 0
-
+ 
     try:
         while True:
             now = datetime.utcnow()
@@ -139,22 +97,17 @@ async def transcribe_audio(websocket, path, args):
                     phrase_complete = True
                
                 clients[client_id]["phrase_time"] = now
-
+ 
                 while not clients[client_id]["data_queue"].empty():
                     clients[client_id]["last_sample"] += clients[client_id]["data_queue"].get()
                
-                if len(clients[client_id]["last_sample"]) > args.record_timeout * 16000 * 1:
+                if len(clients[client_id]["last_sample"]) > args.record_timeout * 16000 * 1: #changed
                     audio_data = clients[client_id]["last_sample"]
                     clients[client_id]["last_sample"] = bytes()
-
-                    # Apply VAD
-                    frames = frame_generator(30, audio_data, 16000)
-                    frames = list(frames)
-                    segments = vad_collector(16000, 30, 300, vad, frames)
-
-                    for segment in segments:
-                        audio_np = np.frombuffer(segment, dtype=np.int16).astype(np.float32) / 32768.0
-
+ 
+                    if is_speech(audio_data, args.energy_threshold):
+                        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0 #
+ 
                         try:
                             segments, info = audio_model.transcribe(audio_np, language="en")
                             text = " ".join([segment.text for segment in segments])
@@ -164,10 +117,10 @@ async def transcribe_audio(websocket, path, args):
                         except Exception as e:
                             logger.error(f"Transcription error: {e}")
                             continue
-
+ 
                         if filtered_text.strip():
                             clients[client_id]["current_phrase"] += filtered_text.strip() + " "
-
+ 
                         if phrase_complete:
                             if clients[client_id]["current_phrase"].strip():
                                 clients[client_id]["transcription"].append(clients[client_id]["current_phrase"].strip())
@@ -177,9 +130,12 @@ async def transcribe_audio(websocket, path, args):
                         elif filtered_text.strip():
                             await websocket.send(filtered_text.strip())
                             logger.debug(f"Sent interim result: {filtered_text.strip()}")
-
+ 
                         logger.info(f"Client {client_id}: {clients[client_id]['current_phrase']}")
-
+ 
+                    else:
+                        logger.debug("Audio chunk below energy threshold - no transcription attempted")
+ 
                     cpu_usage, memory_usage = get_resource_usage()
                     max_cpu_usage = max(max_cpu_usage, cpu_usage)
                     max_memory_usage = max(max_memory_usage, memory_usage)
@@ -192,7 +148,7 @@ async def transcribe_audio(websocket, path, args):
     finally:
         # Save the entire session's audio
         save_session_audio(clients[client_id]["session_audio"], client_id)
-
+ 
         logger.info(f"Resource Usage for client {client_id}:")
         logger.info(f"Total runtime: {time.time() - start_time:.2f} seconds")
         logger.info(f"Peak CPU usage: {max_cpu_usage:.2f}%")
@@ -205,8 +161,6 @@ async def transcribe_audio(websocket, path, args):
             logger.info(clients[client_id]["current_phrase"])
        
         del clients[client_id]
-
-# The rest of the script (main function, argument parsing, etc.) remains the same
  
 async def main(args):
     global audio_model
