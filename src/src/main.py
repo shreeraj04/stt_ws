@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument(
         "--vad-args",
         type=str,
-        default='{"auth_token": "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"}',
+        default='{"auth_token": ""}',
         help="JSON string of additional arguments for VAD pipeline",
     )
     parser.add_argument(
